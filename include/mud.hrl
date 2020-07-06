@@ -33,6 +33,37 @@
 -define(STR(X), (<<X/utf8>>)).
 
 
+-define(LAGER_TAG(T), ([{tag, T}])).
+
+
+-define(CRITICAL(F), (lager:critical(F))).
+-define(CRITICAL(F, A), (lager:critical(F, A))).
+-define(CRITICAL(T, F, A), (lager:critical(?LAGER_TAG(T), F, A))).
+
+-define(ERROR(F), (lager:error(F))).
+-define(ERROR(F, A), (lager:error(F, A))).
+-define(ERROR(T, F, A), (lager:error(?LAGER_TAG(T), F, A))).
+
+-define(WARNING(F), (lager:warning(F))).
+-define(WARNING(F, A), (lager:warning(F, A))).
+-define(WARNING(T, F, A), (lager:warning(?LAGER_TAG(T), F, A))).
+
+
+-define(NOTICE(F), (lager:notice(F))).
+-define(NOTICE(F, A), (lager:notice(F, A))).
+-define(NOTICE(T, F, A), (lager:notice(?LAGER_TAG(T), F, A))).
+
+-define(INFO(F), (lager:info(F))).
+-define(INFO(F, A), (lager:info(F, A))).
+-define(INFO(T, F, A), (lager:info(?LAGER_TAG(T), F, A))).
+
+-define(DEBUG(F), (lager:debug(F))).
+-define(DEBUG(F, A), (lager:debug(F, A))).
+-define(DEBUG(T, F, A), (lager:debug(?LAGER_TAG(T), F, A))).
+
+-define(FOOTMARK, (lager:notice("FOOTMARK >> ~p line:~p", [?MODULE, ?LINE])).
+
+
 -endif.
 
 
