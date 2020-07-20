@@ -18,7 +18,7 @@
 -export([make_table_name/1, get_table_name/1, make_idx_table_name/1, get_key/2,
     db_select_all/1, db_select/2, db_select/3,
     db_insert/2, db_update/2, db_update_some/2, db_delete/2,
-    schedule_save/3, schedule_expire/3, cancel_expire/2,
+    schedule_save/3, cancel_save/2, schedule_expire/3, cancel_expire/2,
     analyze_expire/1, schedule_task/2]).
 
 
@@ -82,6 +82,11 @@ schedule_save(Key, _Ti, SaveList) ->
         ?true -> SaveList;
         ?false -> [Key | SaveList]
     end.
+
+%% 取消保存
+cancel_save(Key, SaveList) ->
+    lists:delete(Key, SaveList).
+
 
 %% 老化
 schedule_expire(_Key, 0, ToExpire) ->

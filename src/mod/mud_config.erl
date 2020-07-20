@@ -13,7 +13,7 @@
 -include("mud.hrl").
 
 %% API
--export([]).
+-export([load/0, get_env/1, get_env/2]).
 
 
 
@@ -23,6 +23,28 @@ load() ->
     %% 开始载入
     lists:foreach(fun load_dir/1, AllCfgDirs),
     ok.
+
+get_env(Key) when not is_list(Key) -> get_env([Key]);
+get_env([App | KeyList]) ->
+    case application:get_all_env(App) of
+        [] ->
+            %% 免得每次call去判断，直接找不到就去ms找
+            Conf = application:get_all_env(ms),
+            mud_proplists:get_value_recursive([App | KeyList], Conf);
+        Conf ->
+            mud_proplists:get_value_recursive(KeyList, Conf)
+    end;
+get_env(KeyList) ->
+    Conf = application:get_all_env(ms),
+    mud_proplists:get_value_recursive(KeyList, Conf).
+
+
+get_env(Key, Default) ->
+    V = get_env(Key),
+    if
+        V =:= ?undefined -> Default;
+        ?true -> V
+    end.
 
 
 %% 载入某个目录下的配置

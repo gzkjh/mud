@@ -6,7 +6,7 @@
 %%% @end
 %%% Created : 10. 7月 2020 20:40
 %%%-------------------------------------------------------------------
--module(mud_cache_ets_worker).
+-module(mud_cache_mnesia_worker).
 -author("Commando").
 
 
@@ -69,21 +69,19 @@ init([Name, Opts]) ->
     First = rand:uniform(60), %% 如果没有设置初始时间，则随机分布在1分钟内
     ?IF(LoopTime > 0, erlang:send_after(?SECOND_TO_MS(First), self(), 'loop_task@self')),
 
-    %% ets相关
-    Tweaks = maps:get(tweaks, Opts, []),
-    EtsOpt = make_options(Tweaks, [named_table]),    %% set,protected 这2个是默认的
+
     %% 构造表名字
-    EtsName = mud_cache_lib:make_table_name(Name),
-    %% 创建
-    ets:new(EtsName, EtsOpt),
+    TblName = mud_cache_lib:make_table_name(Name),
+    %% 初始化表格
+    init_table(TblName),
 
     %% 索引表
-    EtsNameIdx2 =
+    IdxTblName =
         if
             is_tuple(KeyPos) ->  %% 有需要才创建
-                EtsNameIdx = mud_cache_lib:make_idx_table_name(Name),
-                ets:new(EtsNameIdx, [set, named_table, private]),
-                EtsNameIdx;
+                NameIdx = mud_cache_lib:make_idx_table_name(Name),
+                init_idx_table(NameIdx),
+                NameIdx;
             ?true ->
                 ?undefined
         end,
@@ -91,8 +89,8 @@ init([Name, Opts]) ->
     %% 状态
     State = #state{
         name = Name,
-        tbl = EtsName,
-        tbl_idx = EtsNameIdx2,
+        tbl = TblName,
+        tbl_idx = IdxTblName,
         keypos = KeyPos,
         save_interval = SaveTime,
         invalid_interval = InvalidTime,
@@ -205,7 +203,8 @@ handle_info(Msg = 'loop_task@self', State = #state{loop_timeout = Sec, to_save =
 handle_info(stop, State = #state{to_save = ToSave}) ->
     State2 = do_task_save(ToSave, State),
     {stop, normal, State2};
-handle_info(_Info, State = #state{}) ->
+handle_info(Info, State = #state{}) ->
+    ?WARNING("~p unhandle info ~p", [?MODULE, Info]),
     {noreply, State}.
 
 %% @private
@@ -215,10 +214,8 @@ handle_info(_Info, State = #state{}) ->
 %% with Reason. The return value is ignored.
 -spec(terminate(Reason :: (normal | shutdown | {shutdown, term()} | term()),
     State :: #state{}) -> term()).
-terminate(_Reason, _State = #state{tbl = Tbl, tbl_idx = TblIdx}) ->
-    %% 释放ets
-    ets:delete(Tbl),
-    ?IF(TblIdx =/= ?undefined, ets:delete(TblIdx)),
+terminate(_Reason, _State) ->
+    %% mnesia是跨节点的，某个节点关闭，就不清理数据了
     ok.
 
 %% @private
@@ -233,28 +230,23 @@ code_change(_OldVsn, State = #state{}, _Extra) ->
 %%% Internal functions
 %%%===================================================================
 
-make_options([], Ret) -> Ret;
-make_options([read_concurrency | Rest], Ret) ->
-    make_options(Rest, [{read_concurrency, ?true} | Ret]);
-make_options([write_concurrency | Rest], Ret) ->
-    make_options(Rest, [{write_concurrency, ?true} | Ret]).
 
 
-get_simple_key_from_ets(State, Key) ->
+get_simple_key_from_mnesia(State, Key) ->
     #state{tbl = Tbl} = State,
-    case ets:lookup(Tbl, Key) of
+    case mnesia:dirty_read(Tbl, Key) of
         [] -> ?undefined;
-        [{_, Data}] -> Data
+        [#mdv{value = Data}] -> Data
     end.
 
 
-get_half_key_from_ets(State, KeyOne) ->
+get_half_key_from_mnesia(State, KeyOne) ->
     #state{tbl_idx = TblIdx} = State,
-    case ets:lookup(TblIdx, KeyOne) of
+    case mnesia:dirty_read(TblIdx, KeyOne) of
         [] ->
             ?undefined;
-        [{_KeyOne, KeyTwoList}] ->
-            [get_simple_key_from_ets(State, {KeyOne, KeyTwo}) || KeyTwo <- KeyTwoList]
+        [#mdv{value = KeyTwoList}] ->
+            [get_simple_key_from_mnesia(State, {KeyOne, KeyTwo}) || KeyTwo <- KeyTwoList]
     end.
 
 get_simple_key_from_db(State = #state{save_interval = Ti, tbl_idx = ?undefined}, Key) when Ti =/= 0 ->
@@ -264,31 +256,38 @@ get_simple_key_from_db(State = #state{save_interval = Ti, tbl_idx = ?undefined},
             ?undefined;
         [Data | _] ->
             %% 写入缓存
-            store_to_ets(State, Key, Data),
+            store_to_mnesia(State, Key, Data),
             Data
     end;
 get_simple_key_from_db(_State, _Key) ->
     ?undefined.
 
-store_to_ets(#state{tbl = Tbl}, Key, Value) ->
+store_to_mnesia(#state{tbl = Tbl}, Key, Value) ->
     %% 用insert_new避免覆盖
-    ets:insert_new(Tbl, {Key, Value}).
+    try
+        mnesia:dirty_write(Tbl, #mdv{key = Key, value = Value}),
+        ?true
+    catch
+        _Type:Reason ->
+            ?ERROR("store_to_mnesia false ~p", [Reason]),
+            ?false
+    end.
 
 %% 把主键索引起来
-store_to_ets_idx(#state{tbl_idx = Tbl}, KeyOne, KeyTwoList) ->
-    ets:insert(Tbl, {KeyOne, KeyTwoList}),
+store_to_mnesia_idx(#state{tbl_idx = Tbl}, KeyOne, KeyTwoList) ->
+    mnesia:dirty_write(Tbl, #mdv{key = KeyOne, value = KeyTwoList}),
     ok.
 
 
 load_db_by_half_key(#state{tbl_idx = ?undefined}, _KeyOne) ->
     ok;
 load_db_by_half_key(State = #state{tbl_idx = TblIdx, save_interval = Save}, KeyOne) ->
-    case ets:lookup(TblIdx, KeyOne) of
+    case mnesia:dirty_read(TblIdx, KeyOne) of
         %% 从来没加载过
         [] ->
             if
-                Save =:= 0 -> ets:insert_new(TblIdx, {KeyOne, []});    %% 没存档
-                ?true -> do_load_from_db_by_half_key(State, KeyOne)
+                Save =:= 0 -> mnesia:dirty_write(TblIdx, #mdv{key = KeyOne, value = []});    %% 没存档
+                ?true -> do_load_from_db_by_half_key(State, KeyOne) %% 存档的
             end;
         _ -> ?skip
     end,
@@ -303,20 +302,20 @@ do_load_from_db_by_half_key(State = #state{name = Name}, KeyOne) ->
                 K = mud_cache_lib:get_key(V, State),
                 {_K1, K2} = K,
                 %% 存入ets
-                store_to_ets(State, K, V),
+                store_to_mnesia(State, K, V),
                 {[K2 | Keys], Datas#{K => V}}
             end, {[], #{}}, DataList),
     %% 写入索引缓存
-    store_to_ets_idx(State, KeyOne, KeyTwoList),
+    store_to_mnesia_idx(State, KeyOne, KeyTwoList),
     DataMap.
 
 
 add_half_key({KeyOne, KeyTwo}, #state{tbl_idx = TblIdx} = State) when TblIdx =/= ?undefined ->
     load_db_by_half_key(State, KeyOne),
-    [{_KeyOne, KeyTwoList}] = ets:lookup(TblIdx, KeyOne),
+    [#mdv{value = KeyTwoList}] = mnesia:dirty_read(TblIdx, KeyOne),
     case lists:member(KeyTwo, KeyTwoList) of
         ?true -> ?skip;
-        ?false -> ets:insert(TblIdx, {KeyOne, [KeyTwo | KeyTwoList]})
+        ?false -> mnesia:dirty_write(TblIdx, #mdv{key = KeyOne, value = [KeyTwo | KeyTwoList]})
     end,
     ok;
 add_half_key(_Key, _State) ->
@@ -324,12 +323,12 @@ add_half_key(_Key, _State) ->
 
 
 sub_half_key({KeyOne, KeyTwo}, #state{tbl_idx = TblIdx}) when TblIdx =/= ?undefined ->
-    case ets:lookup(TblIdx, KeyOne) of
-        [{_KeyOne, KeyTwoList}] ->
+    case mnesia:dirty_read(TblIdx, KeyOne) of
+        [#mdv{value = KeyTwoList}] ->
             %% 删除
             KeyTwoList2 = lists:delete(KeyTwo, KeyTwoList),
             %% 更新
-            ets:insert(TblIdx, {KeyOne, KeyTwoList2}),
+            mnesia:dirty_write(TblIdx, #mdv{key = KeyOne, value = KeyTwoList2}),
             ok;
         _ ->
             ok
@@ -339,7 +338,7 @@ sub_half_key(_Key, _State) -> ok.
 
 
 remove_half_key({KeyOne, _KeyTwo}, #state{tbl_idx = TblIdx}) when TblIdx =/= ?undefined ->
-    ets:delete(TblIdx, KeyOne);
+    mnesia:dirty_delete(TblIdx, KeyOne);
 remove_half_key(_Key, _State) -> ok.
 
 
@@ -348,10 +347,10 @@ do_lookup(Key, State = #state{tbl_idx = ?undefined}) -> %% 简单键
     get_simple_key_from_db(State, Key);
 do_lookup({KeyOne, _} = Key, State) ->
     load_db_by_half_key(State, KeyOne),
-    get_simple_key_from_ets(State, Key);
+    get_simple_key_from_mnesia(State, Key);
 do_lookup(KeyOne, State) when is_number(KeyOne);is_binary(KeyOne);is_atom(KeyOne);is_list(KeyOne) ->
     load_db_by_half_key(State, KeyOne),
-    get_half_key_from_ets(State, KeyOne).
+    get_half_key_from_mnesia(State, KeyOne).
 
 
 do_insert(Key, Value, State) ->
@@ -360,7 +359,7 @@ do_insert(Key, Value, State) ->
     %% 这里先判断，再去insert_new，否则可能影响判断
     add_half_key(Key, State),
     %% 开始插入
-    case store_to_ets(State, Key, Value) of
+    case store_to_mnesia(State, Key, Value) of
         ?true ->
             ?IF(Ti > 0, mud_cache_lib:db_insert(Name, Value)),
             ?true;
@@ -379,7 +378,7 @@ do_update(Value, State) ->
     add_half_key(Key, State),
 
     %% 更新缓存
-    ets:insert(Tbl, {Key, Value}),
+    mnesia:dirty_write(Tbl, #mdv{key = Key, value = Value}),
 
     %% 安排保存和老化任务
     State2 = mud_cache_lib:schedule_task(Key, State),
@@ -396,7 +395,7 @@ do_delete(Key, State) ->
     %% 移除单个复合索引
     sub_half_key(Key, State),
     %% 删除缓存
-    ets:delete(Tbl, Key),
+    mnesia:dirty_delete(Tbl, Key),
 
     %% 删除数据库
     ?IF(Ti > 0, mud_cache_lib:db_delete(Name, Key)),
@@ -413,7 +412,7 @@ do_delete(Key, State) ->
 do_expire(Key, now, #state{tbl = Tbl, tbl_idx = TblIdx, save_interval = 0} = State) ->
     %% 缓存是按主键去老化的，所以这里用的是 remove_half_key/2 而不是 sub_half_key/2
     remove_half_key(Key, TblIdx),
-    ets:delete(Tbl, Key),
+    mnesia:dirty_delete(Tbl, Key),
     State;
 do_expire(Key, 0, #state{to_expire = ToExpire, invalid_interval = Sec} = State) ->
     ToExpire2 = mud_cache_lib:schedule_expire(Key, Sec, ToExpire),
@@ -427,10 +426,10 @@ do_save(_Key, #state{name = Name, save_interval = 0} = State) ->
     ?WARNING("cache ~p cann't save data (no dbase_info config)", [Name]),
     State;
 do_save(Key, #state{name = Name, tbl = Tbl, to_save = ToSave} = State) ->
-    case ets:lookup(Tbl, Key) of
+    case mnesia:dirty_read(Tbl, Key) of
         [] ->
             State;
-        [{_, Data}] ->
+        [#mdv{value = Data}] ->
             %% 保存到数据库
             mud_cache_lib:db_update(Name, Data),
             %% 计划任务里面的可以删掉
@@ -443,7 +442,7 @@ do_save(Key, #state{name = Name, tbl = Tbl, to_save = ToSave} = State) ->
 do_task_save([], _State) -> ok;
 do_task_save(ToSave, State) ->
     #state{name = Name} = State,
-    Datas = [get_simple_key_from_ets(State, Key) || Key <- ToSave],
+    Datas = [get_simple_key_from_mnesia(State, Key) || Key <- ToSave],
     Len = erlang:length(Datas),
     ?IF(Len > 0, ?WARNING("~p save ~p datas", [Name, Len])),
     %% 批量更新
@@ -457,8 +456,34 @@ do_task_expire([], _State) -> ok;
 do_task_expire(ToExpire, #state{name = Name, tbl = Tbl, tbl_idx = ?undefined}) ->
     Len = erlang:length(ToExpire),
     ?IF(Len > 0, ?WARNING("~p expire ~p datas", [Name, Len])),
-    %% 遍历删除
-    lists:foreach(fun(Key) -> ets:delete(Tbl, Key) end, ToExpire),
+    Trans =
+        fun() ->
+            %% 遍历删除
+            lists:foreach(fun(KeyOne) -> mnesia:delete(Tbl, KeyOne, write) end, ToExpire)
+        end,
+    mnesia:transaction(Trans),  %% {atomic,ok}
+    ok;
+%% 符合key，按照主键去老化
+do_task_expire(ToExpire, #state{name = Name, tbl = Tbl, tbl_idx = TblIdx}) ->
+    Len = erlang:length(ToExpire),
+    ?IF(Len > 0, ?WARNING("~p expire ~p datas", [Name, Len])),
+    Trans =
+        fun() ->
+            %% 遍历删除
+            lists:foreach(
+                fun(KeyOne) ->
+                    case mnesia:read(TblIdx, KeyOne) of
+                        [] ->
+                            ?skip;
+                        [#mdv{value = KeyTwoList}] ->
+                            %% 删除数据
+                            lists:foreach(fun(KeyTwo) -> mnesia:delete(Tbl, {KeyOne, KeyTwo}, write) end, KeyTwoList)
+                    end,
+                    %% 删除索引
+                    mnesia:delete(TblIdx, KeyOne, write)
+                end, ToExpire)
+        end,
+    mnesia:transaction(Trans),  %% {atomic,ok}
     ok.
 
 
@@ -471,9 +496,9 @@ do_preload_datas(#state{tbl_idx = ?undefined} = State) ->  %% 简单数据，直
         fun(V) ->
             K = mud_cache_lib:get_key(V, State),
             %% 存入ets
-            store_to_ets(State, K, V)
+            store_to_mnesia(State, K, V)
         end, Datas),
-    Size = ets:info(Tbl, size),
+    Size = mnesia:table_info(Tbl, size),
     ?IF(Size > 10000,
         ?WARNING("cache ~p preload ~p datas and never invalid!!!", [Name, Size]),
         ?NOTICE("cache ~p preload ~p datas and never invalid!!!", [Name, Size])),
@@ -487,7 +512,7 @@ do_preload_datas(State) ->  %% 复合数据，还要写入key的索引
             fun(V, Kmap) ->
                 K = mud_cache_lib:get_key(V, State),
                 %% 存入ets
-                store_to_ets(State, K, V),
+                store_to_mnesia(State, K, V),
                 %% 生成索引
                 {K1, K2} = K,
                 K2ls = maps:get(K1, Kmap, []),
@@ -497,7 +522,7 @@ do_preload_datas(State) ->  %% 复合数据，还要写入key的索引
     %% 写入索引缓存（上面加载的时候已经把值存了）
     lists:foreach(
         fun({KeyOne, KeyTwoList}) ->
-            store_to_ets_idx(State, KeyOne, KeyTwoList)
+            store_to_mnesia_idx(State, KeyOne, KeyTwoList)
         end, maps:to_list(KeyMaps)),
 
     Size = ets:info(Tbl, size),
@@ -507,6 +532,103 @@ do_preload_datas(State) ->  %% 复合数据，还要写入key的索引
     ok.
 
 
+%% 确定mnesia启动
+ensure_mnesia_start() ->
+    case mnesia:start() of
+        ok -> ?skip;
+        {error, Reason} -> ?ERROR("mnesia start fail ~p", [Reason])
+    end,
+    ok.
+
+%% 检查是否已经加入mnesia集群
+check_join_mnesia_nodes() ->
+    Ns = get_table_nodes(),
+    ?WARNING("mnesia nodes ~p", [Ns]),
+    case mnesia:system_info(db_nodes) of
+        Ns ->
+            ?true;
+        _ ->
+            mnesia:change_config(extra_db_nodes, Ns),
+            ?true
+    end.
+
+
+%% 检查表
+%% 1、如果表不存在，创建
+%% 2、如果表存在，并且字段相同，则加入
+%% 3、如果表已经存在，并且字段不同，则自己独立成为节点
+check_table(Tbl) ->
+    Tables = mnesia:system_info(tables),
+    case lists:member(Tbl, Tables) of
+        ?true ->
+            %% 检查字段
+            check_table_fields(Tbl);
+        ?false ->
+            %% 创建
+            create_table(Tbl)
+    end,
+    ok.
+
+
+%% 检查字段是否相同
+check_table_fields(Tbl) ->
+    Fields = record_info(fields, ?DATA_STRUCT),
+    case mnesia:table_info(Tbl, attributes) of
+        Fields -> check_join_table(Tbl);
+        _ -> ok
+    end,
+    ok.
+
+
+%% 检查是否加入table的节点
+check_join_table(Tbl) ->
+    Node = erlang:node(),
+    Ls = mnesia:table_info(Tbl, ram_copies),
+    case lists:member(Node, Ls) of
+        ?true ->
+            ?skip;
+        ?false ->
+            %% 加入
+            mnesia:add_table_copy(Tbl, Node, ram_copies),
+            %% 等待表可用
+            mnesia:wait_for_tables([Tbl], ?SECOND_TO_MS(10))
+    end,
+    ok.
+
+
+%% 创建mneisa的表
+create_table(Name) ->
+    Def = [
+        {access_mode, read_write},  %% 可以是 read_only
+        {attributes, record_info(fields, ?DATA_STRUCT)}, %% 字段属性
+        {ram_copies, [erlang:node()]},   %% 节点列表
+        {type, set}  %% 类型固定set
+    ],
+    %% 必须成功
+    {atomic, ok} = mnesia:create_table(Name, Def),
+    ok.
+
+
+%% 获取表格的节点
+get_table_nodes() ->
+    %% todo 这里看看能优化不
+    Group = 1,%%?SERVER_GROUP,
+    mud_config:get_env([center, game_nodes, Group], [erlang:node()]).
+
+
+%% 构建数据表
+init_table(TbName) ->
+    %% 确保mnesia启动
+    ensure_mnesia_start(),
+    %% 加入节点
+    check_join_mnesia_nodes(),
+    check_table(TbName),
+    ok.
+
+%% 构建索引表
+init_idx_table(TbName) ->
+    check_table(TbName),
+    ok.
 
 
 
